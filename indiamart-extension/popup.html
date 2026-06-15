@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IndiaMART Lead Auto-Contact</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+
+    <!-- Header -->
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">🤝</span>
+        <div>
+          <h1 class="title">IndiaMART</h1>
+          <p class="subtitle">Lead Auto-Contact</p>
+        </div>
+      </div>
+      <div id="statusBadge" class="status-badge status-off">OFF</div>
+    </header>
+
+    <!-- Alert -->
+    <div id="alertBox" class="alert hidden"></div>
+
+    <!-- Server status -->
+    <section class="card server-card">
+      <div class="server-row">
+        <span class="server-label">
+          <span id="serverDot" class="dot dot-off"></span>
+          Python Server
+        </span>
+        <span id="serverStatus" class="server-val">checking…</span>
+      </div>
+      <div class="server-row">
+        <span class="server-label">Leads loaded</span>
+        <span id="serverLeads" class="server-val">—</span>
+      </div>
+      <div class="server-row">
+        <span class="server-label">Last updated</span>
+        <span id="serverUpdated" class="server-val">—</span>
+      </div>
+      <p class="field-hint" style="margin-top:6px">
+        Run <code>python3 scraper_loop.py</code> in your terminal to start the server.
+      </p>
+    </section>
+
+    <!-- Toggle -->
+    <section class="card toggle-card">
+      <div class="toggle-row">
+        <div>
+          <p class="label">Automation</p>
+          <p class="desc" id="automationDesc">Click to enable</p>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="enableToggle" />
+          <span class="slider"></span>
+        </label>
+      </div>
+    </section>
+
+
+
+    <!-- Stats -->
+    <section class="card">
+      <p class="card-title">📊 Statistics</p>
+      <div class="stats-grid">
+        <div class="stat-item">
+          <span class="stat-value" id="statScanned">0</span>
+          <span class="stat-label">All Leads</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value green" id="statMatched">0</span>
+          <span class="stat-label">Matched</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value blue" id="statClicked">0</span>
+          <span class="stat-label">Completed</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Queue status -->
+    <section class="card">
+      <p class="card-title">🔄 Queue Status</p>
+      <div class="queue-row">
+        <span class="queue-label">Pending in background:</span>
+        <span class="queue-val" id="queueLength">0</span>
+      </div>
+      <div class="queue-row">
+        <span class="queue-label">Processing:</span>
+        <span class="queue-val" id="isProcessing">No</span>
+      </div>
+    </section>
+
+    <!-- Actions -->
+    <section class="card actions-card">
+      <button class="btn btn-run"       id="runNowBtn">⚡ Run Now</button>
+      <button class="btn btn-secondary" id="refreshBtn">🔄 Refresh Stats</button>
+      <button class="btn btn-danger"    id="clearBtn">🗑️ Clear History</button>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <p>Leads pre-filtered by scraper (GST, state, qty, longevity) • No duplicate contacts</p>
+    </footer>
+
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

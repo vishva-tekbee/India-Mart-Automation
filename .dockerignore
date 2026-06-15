@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Environment
+.env
+
+# Data files
+latest_leads.json
+indiamart_cashew.json
+.scraper_meta.json
+*.tmp
+
+# Docker
+mongo_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
