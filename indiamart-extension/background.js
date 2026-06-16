@@ -14,7 +14,7 @@
 'use strict';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const LOCAL_SERVER       = 'http://127.0.0.1:7891';
+const LOCAL_SERVER       = 'http://127.0.0.1:8000';
 const LEADS_URL          = `${LOCAL_SERVER}/leads`;
 const STATUS_URL         = `${LOCAL_SERVER}/status`;
 const TAB_LOAD_TIMEOUT   = 20_000;   // ms to wait for a tab to load
@@ -99,7 +99,7 @@ async function runCycle() {
 
   const leads = await fetchLeads();
   if (!leads) {
-    notify('❌ Server not reachable', 'Start scraper_loop.py in the terminal');
+    notify('❌ Server not reachable', 'Run: uvicorn api.main:app --port 8000');
     return { ok: false, reason: 'server_unreachable' };
   }
 
@@ -251,150 +251,152 @@ function injectedClickPhase1(leadLocation, leadDisplayId) {
       .toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
+  // ── Normalize location for matching ───────────────────────────────────────
   const locLower = (leadLocation || '').toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
-  // Extract city and state parts for flexible matching
-  const locParts = locLower.split(' ').filter(p => p.length > 2);
+  const locParts = locLower.split(' ').filter(p => p.length > 2); // e.g. ["kamrup", "assam"]
 
-  /**
-   * Find the contact button within a given listing card element.
-   */
-  function findContactBtn(container) {
-    // Check for IndiaMART-specific class first
-    for (const btn of container.querySelectorAll('.TRA_contact_buyer')) {
-      if (isVisible(btn)) return btn;
-    }
-    // Look for buttons/links with contact text
-    const CONTACT_TEXTS = [
-      'contact buyer now', 'contact buyer', 'buy lead', 'contact now',
-      'send enquiry', 'enquire now',
-    ];
-    const btns = container.querySelectorAll(
-      'button, a, div, span, input[type=button], input[type=submit], [role=button]'
-    );
-    for (const btn of btns) {
-      if (!isVisible(btn)) continue;
-      const t = getNormText(btn);
-      if (CONTACT_TEXTS.some(ct => t.includes(ct))) return btn;
-    }
-    return null;
-  }
+  console.log(`[injected] 🔍 Looking for: location="${leadLocation}", displayId="${leadDisplayId}"`);
 
-  /**
-   * Check if a listing card's text content matches our target location.
-   */
-  function cardMatchesLocation(card) {
-    if (!locParts.length) return false;
-    const cardText = card.textContent.toLowerCase();
-    // All significant parts of the location must appear in the card
-    return locParts.every(part => cardText.includes(part));
-  }
-
-  /**
-   * Check if a card contains the displayId (in data attributes or hidden text).
-   */
-  function cardMatchesDisplayId(card) {
-    if (!leadDisplayId) return false;
-    // Check data attributes
-    for (const attr of card.attributes) {
-      if (String(attr.value).includes(leadDisplayId)) return true;
-    }
-    // Check inner elements with data attributes
-    const inner = card.querySelectorAll('[data-id], [data-blid], [data-displayid], [data-leadid]');
-    for (const el of inner) {
-      for (const attr of el.attributes) {
-        if (String(attr.value).includes(leadDisplayId)) return true;
-      }
-    }
-    return false;
-  }
-
-  // ── Collect all listing cards on the page ──────────────────────────────────
-  // IndiaMART uses various card containers; try common patterns
-  const CARD_SELECTORS = [
-    '.brd_card', '.card', '.listing', '.result-card',
-    '[class*="listing"]', '[class*="result"]', '[class*="card"]',
-    '.TRA_blCard', '.TRA_card',
-    'li[class*="bl"]', 'div[class*="bl_"]',
+  // ── Step 1: Find ALL contact buttons on the page ──────────────────────────
+  const CONTACT_TEXTS = [
+    'contact buyer now', 'contact buyer', 'contact now',
+    'send enquiry', 'enquire now', 'buy lead',
   ];
 
-  let cards = [];
-  for (const sel of CARD_SELECTORS) {
-    try {
-      const found = document.querySelectorAll(sel);
-      if (found.length > 0) {
-        cards = [...found].filter(c => findContactBtn(c) !== null);
-        if (cards.length > 0) break;
-      }
-    } catch (_) {}
-  }
-
-  console.log(`[injected] Found ${cards.length} listing cards with contact buttons`);
-  console.log(`[injected] Looking for location: "${locLower}", displayId: "${leadDisplayId}"`);
-
-  // ── Strategy 1: Match by displayId (most precise) ─────────────────────────
-  if (leadDisplayId) {
-    for (const card of cards) {
-      if (cardMatchesDisplayId(card)) {
-        const btn = findContactBtn(card);
-        if (btn) {
-          btn.click();
-          return { ok: true, phase: 1, matched: 'displayId', displayId: leadDisplayId };
-        }
-      }
-    }
-  }
-
-  // ── Strategy 2: Match by location text in the card ────────────────────────
-  if (locParts.length > 0) {
-    for (const card of cards) {
-      if (cardMatchesLocation(card)) {
-        const btn = findContactBtn(card);
-        if (btn) {
-          btn.click();
-          const cardSnippet = card.textContent.trim().slice(0, 100);
-          return { ok: true, phase: 1, matched: 'location', location: leadLocation, cardSnippet };
-        }
-      }
-    }
-  }
-
-  // ── Strategy 3: If search was specific enough, take the first result ──────
-  // Only if we have cards but location matching failed (search already narrowed)
-  if (cards.length > 0 && cards.length <= 3) {
-    const btn = findContactBtn(cards[0]);
-    if (btn) {
-      btn.click();
-      const cardSnippet = cards[0].textContent.trim().slice(0, 100);
-      return { ok: true, phase: 1, matched: 'first-of-few', cardCount: cards.length, cardSnippet };
-    }
-  }
-
-  // ── Fallback: find ANY visible contact button on the page ─────────────────
-  // (original approach — only if card-based approach found nothing)
-  for (const el of document.querySelectorAll('.TRA_contact_buyer')) {
-    if (!isVisible(el)) continue;
-    el.click();
-    return { ok: true, phase: 1, matched: 'TRA_contact_buyer_fallback', text: el.textContent.trim() };
-  }
-
-  const allEls = [
+  const allClickables = [
     ...document.querySelectorAll(
-      'button, a, div, span, input[type=button], input[type=submit], [role=button]'
-    )
+      'button, a, div, span, input[type=button], input[type=submit], [role=button], .TRA_contact_buyer'
+    ),
   ];
-  for (const el of allEls) {
-    if (getNormText(el) !== 'contact buyer now') continue;
+
+  // Collect all visible contact buttons
+  const contactButtons = [];
+  for (const el of allClickables) {
     if (!isVisible(el)) continue;
-    el.click();
-    return { ok: true, phase: 1, matched: 'exact-text-fallback', text: el.textContent.trim() };
+    const t = getNormText(el);
+    if (CONTACT_TEXTS.some(ct => t.includes(ct))) {
+      contactButtons.push(el);
+    }
   }
 
-  // Debug: dump card info + first 20 clickable elements
-  const cardInfo = cards.slice(0, 5).map(c => c.textContent.trim().slice(0, 80));
-  const found = allEls.slice(0, 20).map(el =>
-    `[${el.tagName}.${el.className}] "${(el.textContent || el.value || '').trim().slice(0, 40)}"`
-  );
-  return { ok: false, reason: 'contact_button_not_found', cardInfo, pageButtons: found };
+  console.log(`[injected] Found ${contactButtons.length} contact buttons on page`);
+
+  if (contactButtons.length === 0) {
+    return {
+      ok: false, reason: 'no_contact_buttons_found',
+      pageButtons: allClickables.slice(0, 15).map(el =>
+        `[${el.tagName}.${(el.className || '').toString().slice(0, 30)}] "${getNormText(el).slice(0, 40)}"`
+      ),
+    };
+  }
+
+  // ── Step 2: For each button, walk UP the DOM to find its listing container ─
+  // A "listing container" is a parent that has enough text (location, product info)
+  // We walk up until we find an element with substantial text content
+  function getListingContainer(btn) {
+    let el = btn.parentElement;
+    let depth = 0;
+    while (el && depth < 12) {
+      const text = el.textContent || '';
+      // A listing container typically has 50+ chars (product name + location + details)
+      if (text.length > 50 && text.length < 5000) {
+        return el;
+      }
+      el = el.parentElement;
+      depth++;
+    }
+    // If we didn't find a good container, return the closest parent with some text
+    el = btn.parentElement;
+    depth = 0;
+    while (el && depth < 8) {
+      if ((el.textContent || '').length > 30) return el;
+      el = el.parentElement;
+      depth++;
+    }
+    return btn.parentElement;
+  }
+
+  // Build an array of { button, container, containerText }
+  const listings = contactButtons.map(btn => {
+    const container = getListingContainer(btn);
+    const containerText = (container?.textContent || '').toLowerCase();
+    return { btn, container, containerText };
+  });
+
+  // Log what we found for debugging
+  listings.forEach((l, i) => {
+    const snippet = l.containerText.replace(/\s+/g, ' ').trim().slice(0, 120);
+    console.log(`[injected] Listing ${i}: "${snippet}..."`);
+  });
+
+  // ── Step 3: Match by displayId (most precise) ─────────────────────────────
+  if (leadDisplayId) {
+    for (const l of listings) {
+      // Check if displayId appears anywhere in the container's HTML or data attributes
+      const html = l.container?.innerHTML || '';
+      if (html.includes(leadDisplayId)) {
+        console.log(`[injected] ✅ Matched by displayId: ${leadDisplayId}`);
+        l.btn.click();
+        return { ok: true, phase: 1, matched: 'displayId', displayId: leadDisplayId };
+      }
+    }
+  }
+
+  // ── Step 4: Match by location text (primary strategy) ─────────────────────
+  if (locParts.length > 0) {
+    // Score each listing by how many location parts it contains
+    const scored = listings.map(l => {
+      const matchCount = locParts.filter(part => l.containerText.includes(part)).length;
+      return { ...l, matchCount, matchRatio: matchCount / locParts.length };
+    });
+
+    // Sort by match count descending
+    scored.sort((a, b) => b.matchCount - a.matchCount);
+
+    // Best match must have ALL location parts (or at least the majority)
+    const best = scored[0];
+    if (best && best.matchRatio >= 0.5) {
+      // Make sure it's actually a better match than the second-best
+      const secondBest = scored[1];
+      const isUnique = !secondBest || best.matchCount > secondBest.matchCount;
+
+      console.log(`[injected] ✅ Matched by location: ${best.matchCount}/${locParts.length} parts`
+        + ` (unique=${isUnique})`);
+      console.log(`[injected]    Parts matched: ${locParts.filter(p => best.containerText.includes(p)).join(', ')}`);
+
+      best.btn.click();
+      return {
+        ok: true, phase: 1, matched: 'location',
+        location: leadLocation,
+        matchCount: best.matchCount,
+        totalParts: locParts.length,
+        isUnique,
+        cardSnippet: best.containerText.replace(/\s+/g, ' ').trim().slice(0, 120),
+      };
+    }
+  }
+
+  // ── Step 5: ONLY click first if there's exactly 1 listing (unambiguous) ───
+  if (listings.length === 1) {
+    console.log(`[injected] ⚠️ Only 1 listing on page — clicking it`);
+    listings[0].btn.click();
+    return {
+      ok: true, phase: 1, matched: 'single-result',
+      cardSnippet: listings[0].containerText.replace(/\s+/g, ' ').trim().slice(0, 120),
+    };
+  }
+
+  // ── No match found — return debug info ────────────────────────────────────
+  console.warn(`[injected] ❌ Could not match location "${leadLocation}" to any listing`);
+  return {
+    ok: false,
+    reason: 'location_not_matched',
+    searchedFor: { location: leadLocation, displayId: leadDisplayId, locParts },
+    listingCount: listings.length,
+    cardInfo: listings.slice(0, 5).map(l =>
+      l.containerText.replace(/\s+/g, ' ').trim().slice(0, 120)
+    ),
+  };
 }
 
 /**

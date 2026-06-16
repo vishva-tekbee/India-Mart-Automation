@@ -15,7 +15,7 @@
 
   "host_permissions": [
     "https://*.indiamart.com/*",
-    "http://127.0.0.1:7891/*"
+    "http://127.0.0.1:8000/*"
   ],
 
   "background": {

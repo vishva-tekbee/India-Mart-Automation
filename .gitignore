@@ -33,7 +33,6 @@ pythonenv/
 .env
 .env.*
 !.env.example
-.env.example
 
 # Local databases and Docker volumes
 mongo_data/

@@ -5,7 +5,7 @@
 
 'use strict';
 
-const LOCAL_SERVER = 'http://127.0.0.1:7891';
+const LOCAL_SERVER = 'http://127.0.0.1:8000';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const enableToggle    = document.getElementById('enableToggle');
@@ -131,7 +131,7 @@ runNowBtn.addEventListener('click', async () => {
 
   const serverOk = await checkServer();
   if (!serverOk) {
-    showAlert('❌ Python server not running!\nRun: python3 scraper_loop.py', 'error', 6000);
+    showAlert('❌ API server not running!\nRun: uvicorn api.main:app --port 8000', 'error', 6000);
     runNowBtn.disabled    = false;
     runNowBtn.textContent = '⚡ Run Now';
     return;
@@ -173,5 +173,12 @@ clearBtn.addEventListener('click', async () => {
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-checkServer();
-refreshAll();
+(async () => {
+  await checkServer();
+  await refreshAll();
+
+  // Auto-refresh every 10 seconds while popup is open
+  setInterval(async () => {
+    await checkServer();
+  }, 10_000);
+})();

@@ -24,7 +24,19 @@ async def fetch_all_pages():
     captured_headers = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",  # Prevents crash on low memory VPS / Free tiers
+                "--disable-gpu",            # No hardware acceleration needed
+                "--no-first-run",
+                "--no-zygote",
+                "--single-process",         # Consolidates processes to save RAM
+                "--disable-extensions",
+            ]
+        )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 900},

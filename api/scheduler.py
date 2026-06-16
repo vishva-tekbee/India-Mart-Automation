@@ -63,7 +63,7 @@ async def scrape_and_store() -> int:
 
         # Step 3: Upsert into MongoDB (dedup by product + location)
         collection = get_leads_collection()
-        now = datetime.utcnow()
+        now = datetime.now()
         new_count = 0
 
         if qualified:
@@ -102,7 +102,7 @@ async def scrape_and_store() -> int:
         lead_count = await collection.count_documents({})
 
         update_scraper_state(
-            last_scrape_time=datetime.utcfromtimestamp(_last_scrape_time),
+            last_scrape_time=datetime.fromtimestamp(_last_scrape_time),
             total_raw=total_raw,
             lead_count=lead_count,
             next_scrape_in_seconds=settings.scrape_interval * 60,
@@ -119,7 +119,7 @@ async def scrape_and_store() -> int:
         # Update status even on failure
         update_scraper_state(
             last_scrape_time=(
-                datetime.utcfromtimestamp(_last_scrape_time)
+                datetime.fromtimestamp(_last_scrape_time)
                 if _last_scrape_time > 0 else None
             ),
             next_scrape_in_seconds=settings.scrape_interval * 60,

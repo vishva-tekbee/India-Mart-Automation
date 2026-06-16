@@ -4,6 +4,7 @@ Provides connection lifecycle and collection accessors.
 """
 
 import logging
+import certifi
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import ASCENDING
 from api.config import settings
@@ -18,7 +19,10 @@ async def init_db() -> None:
     """Connect to MongoDB and create indexes."""
     global _client, _db
     logger.info(f"Connecting to MongoDB at {settings.mongodb_uri}")
-    _client = AsyncIOMotorClient(settings.mongodb_uri)
+    _client = AsyncIOMotorClient(
+        settings.mongodb_uri,
+        tlsCAFile=certifi.where(),  # Use up-to-date CA certs for Atlas SSL
+    )
     _db = _client[settings.mongodb_db]
 
     # Unique compound index to prevent duplicate leads
