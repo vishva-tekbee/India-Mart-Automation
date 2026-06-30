@@ -38,18 +38,14 @@ def get_scraper_state():
 async def get_status():
     """
     Returns the current health of the API and scraper status.
-    Useful for monitoring and CRM polling.
+    Shows the current qualified lead count and raw scrape total.
     """
-    from api.database import get_leads_collection
-    collection = get_leads_collection()
-    lead_count = await collection.count_documents({})
-
     state = get_scraper_state()
 
     return StatusResponse(
         status="running",
         last_scrape_time=state["last_scrape_time"],
-        lead_count=lead_count,
+        lead_count=state["lead_count"],
         total_raw=state["total_raw"],
         next_scrape_in_seconds=state["next_scrape_in_seconds"],
         scrape_interval_minutes=settings.scrape_interval,

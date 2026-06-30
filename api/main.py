@@ -3,7 +3,7 @@ IndiaMART Lead API — FastAPI Application
 
 Production-ready API service that:
   1. Scrapes IndiaMart buyer leads every N minutes (APScheduler)
-  2. Stores them in MongoDB (motor, with deduplication)
+  2. Stores them in-memory + JSON file (no database required)
   3. Exposes REST endpoints for CRM consumption
 
 Run:  uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.config import settings
-from api.database import init_db, close_db
+from api.lead_store import load_leads_from_file, get_all_leads, get_lead_count
 from api.scheduler import start_scheduler, stop_scheduler
 from api.routes import leads, status
 
@@ -37,11 +37,11 @@ logger = logging.getLogger("indiamart.api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: connect DB + start scheduler. Shutdown: clean up."""
+    """Startup: load leads + start scheduler. Shutdown: clean up."""
     logger.info("Starting IndiaMART Lead API…")
 
-    # Connect to MongoDB
-    await init_db()
+    # Load any previously scraped leads from JSON file
+    load_leads_from_file()
 
     # Start the scraper scheduler
     start_scheduler()
@@ -52,7 +52,6 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down…")
     stop_scheduler()
-    await close_db()
     logger.info("Goodbye.")
 
 
@@ -63,7 +62,7 @@ app = FastAPI(
     description=(
         "Production API for IndiaMART buyer lead data.\n\n"
         "Scrapes IndiaMart every 5 minutes, filters by GST/quantity/state/longevity, "
-        "stores in MongoDB, and exposes REST endpoints for CRM integration."
+        "stores in-memory with JSON persistence, and exposes REST endpoints for CRM integration."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -122,7 +121,6 @@ async def root():
         "docs": "/docs",
         "endpoints": {
             "leads": "/api/leads",
-            "new_leads": "/api/leads/new?since=2026-06-15T10:00:00Z",
             "csv_export": "/api/leads/csv",
             "status": "/api/status",
         },
@@ -135,26 +133,22 @@ async def root():
 
 @app.get("/leads", include_in_schema=False)
 async def compat_leads():
-    """Backward-compatible /leads endpoint for Chrome extension (returns raw list)."""
-    from api.database import get_leads_collection
-    collection = get_leads_collection()
-    cursor = collection.find({}, {"_id": 0}).sort("created_at", -1).limit(500)
-    return await cursor.to_list(length=500)
+    """Backward-compatible /leads endpoint for Chrome extension."""
+    return get_all_leads()
 
 
 @app.get("/status", include_in_schema=False)
 async def compat_status():
     """Backward-compatible /status endpoint for Chrome extension."""
     from api.routes.status import get_scraper_state
-    from api.database import get_leads_collection
 
-    collection = get_leads_collection()
-    lead_count = await collection.count_documents({})
     state = get_scraper_state()
 
+    count = get_lead_count()
     return {
         "ok": True,
-        "lead_count": lead_count,
+        "lead_count": count,
+        "total_lead_count": count,
         "total_raw": state["total_raw"],
         "last_updated": (
             state["last_scrape_time"].isoformat()

@@ -34,8 +34,12 @@
         <span id="serverStatus" class="server-val">checking…</span>
       </div>
       <div class="server-row">
-        <span class="server-label">Leads loaded</span>
+        <span class="server-label">Today's leads</span>
         <span id="serverLeads" class="server-val">—</span>
+      </div>
+      <div class="server-row">
+        <span class="server-label">Total stored</span>
+        <span id="serverTotalLeads" class="server-val">—</span>
       </div>
       <div class="server-row">
         <span class="server-label">Last updated</span>
@@ -67,16 +71,20 @@
       <p class="card-title">📊 Statistics</p>
       <div class="stats-grid">
         <div class="stat-item">
-          <span class="stat-value" id="statScanned">0</span>
+          <span class="stat-value" id="statScanned">—</span>
           <span class="stat-label">All Leads</span>
         </div>
         <div class="stat-item">
-          <span class="stat-value green" id="statMatched">0</span>
+          <span class="stat-value green" id="statMatched">—</span>
           <span class="stat-label">Matched</span>
         </div>
         <div class="stat-item">
-          <span class="stat-value blue" id="statClicked">0</span>
+          <span class="stat-value blue" id="statClicked">—</span>
           <span class="stat-label">Completed</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-value amber" id="statExpired">—</span>
+          <span class="stat-label">Expired</span>
         </div>
       </div>
     </section>
@@ -86,11 +94,22 @@
       <p class="card-title">🔄 Queue Status</p>
       <div class="queue-row">
         <span class="queue-label">Pending in background:</span>
-        <span class="queue-val" id="queueLength">0</span>
+        <span class="queue-val" id="queueLength">—</span>
       </div>
       <div class="queue-row">
         <span class="queue-label">Processing:</span>
         <span class="queue-val" id="isProcessing">No</span>
+      </div>
+    </section>
+
+    <!-- Expired Leads -->
+    <section class="card expired-card hidden" id="expiredSection">
+      <div class="expired-header" id="expiredToggle">
+        <p class="card-title">⏰ Expired Leads <span class="expired-count" id="expiredCount">0</span></p>
+        <span class="expand-arrow" id="expandArrow">▶</span>
+      </div>
+      <div class="expired-list hidden" id="expiredList">
+        <!-- Dynamically populated -->
       </div>
     </section>
 

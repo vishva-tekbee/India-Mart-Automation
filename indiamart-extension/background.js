@@ -23,7 +23,7 @@ const MODAL_WAIT_MS      = 1_500;    // ms after first click before starting mod
 const MODAL_POLL_MS      = 500;      // interval between modal search attempts
 const MODAL_TIMEOUT_MS   = 10_000;   // total time to wait for modal before giving up
 const INTER_LEAD_DELAY   = 5_000;    // ms between processing consecutive leads
-const MAX_RETRIES        = 2;
+const MAX_RETRIES        = 5;
 
 // ─── In-memory state (rebuilt on SW restart from storage) ────────────────────
 let cfg = {
@@ -35,14 +35,16 @@ let cfg = {
 };
 let stats        = { scanned: 0, matched: 0, clicked: 0 };
 let processedIds = new Set();
+let expiredLeads = [];  // { product, location, state, reason, timestamp }
 let queue        = [];
 let isProcessing = false;
+let lastActiveDate = '';  // YYYY-MM-DD — used to detect date rollover for daily reset
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 async function loadState() {
   return new Promise(resolve => {
     chrome.storage.local.get(
-      ['enabled', 'threshold', 'interval', 'stats', 'processedIds', 'mobile', 'password'],
+      ['enabled', 'threshold', 'interval', 'stats', 'processedIds', 'expiredLeads', 'mobile', 'password', 'lastActiveDate'],
       data => {
         cfg.enabled   = data.enabled   ?? false;
         cfg.threshold = data.threshold ?? 500;
@@ -51,6 +53,22 @@ async function loadState() {
         cfg.password  = data.password  ?? '';
         stats         = data.stats     ?? { scanned: 0, matched: 0, clicked: 0 };
         processedIds  = new Set(data.processedIds || []);
+        expiredLeads  = data.expiredLeads || [];
+        lastActiveDate = data.lastActiveDate || '';
+
+        // Check for date rollover — clear history if a new day started
+        const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+        if (lastActiveDate && lastActiveDate !== today) {
+          console.log(`[bg] 🌅 New day detected (${lastActiveDate} → ${today}). Clearing processed history.`);
+          processedIds = new Set();
+          stats = { scanned: 0, matched: 0, clicked: 0 };
+          expiredLeads = [];
+          chrome.storage.local.set({ processedIds: [], stats, expiredLeads, lastActiveDate: today });
+        } else if (!lastActiveDate) {
+          chrome.storage.local.set({ lastActiveDate: today });
+        }
+        lastActiveDate = today;
+
         resolve();
       }
     );
@@ -63,6 +81,10 @@ function saveStats() {
 
 function saveProcessedIds() {
   chrome.storage.local.set({ processedIds: [...processedIds] });
+}
+
+function saveExpiredLeads() {
+  chrome.storage.local.set({ expiredLeads });
 }
 
 // ─── Quantity parser ──────────────────────────────────────────────────────────
@@ -96,6 +118,17 @@ async function fetchLeads() {
 // ─── Run one scan+queue cycle ─────────────────────────────────────────────────
 async function runCycle() {
   console.log('[bg] 🔄 Starting cycle…');
+
+  // Check for date rollover before each cycle
+  const today = new Date().toISOString().slice(0, 10);
+  if (lastActiveDate && lastActiveDate !== today) {
+    console.log(`[bg] 🌅 Date rolled over (${lastActiveDate} → ${today}). Clearing processed history.`);
+    processedIds = new Set();
+    stats = { scanned: 0, matched: 0, clicked: 0 };
+    expiredLeads = [];
+    lastActiveDate = today;
+    chrome.storage.local.set({ processedIds: [], stats, expiredLeads, lastActiveDate: today });
+  }
 
   const leads = await fetchLeads();
   if (!leads) {
@@ -233,12 +266,231 @@ async function tabExists(tabId) {
  * PHASE 1 — Find the CORRECT listing on the search results page and click
  * its "Contact Buyer Now" button.
  *
- * Accepts lead metadata (location, displayId) so it can match the right
- * buyer card instead of blindly clicking the first result.
+ * Accepts full lead metadata (product, location, displayId, minQtyKg) to
+ * strictly verify the match before clicking. Prevents clicking random leads.
  *
  * Injected into the lead tab via chrome.scripting.executeScript.
  */
-function injectedClickPhase1(leadLocation, leadDisplayId) {
+function injectedClickPhase1(leadProduct, leadLocation, leadDisplayId, minQtyKg) {
+  function isVisible(el) {
+    if (!el) return false;
+    const s = window.getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0'
+      && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+  }
+
+  function realClick(el) {
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.dispatchEvent(new MouseEvent('click', opts));
+  }
+
+  // ── Normalize inputs ───────────n───────────────────────────────────────────
+  const prodLower = (leadProduct || '').toLowerCase().replace(/&amp;/g, ' ').replace(/[&]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const prodWords = prodLower.split(' ').filter(p => p.length > 2);
+
+  const locLower = (leadLocation || '').toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+  const locParts = locLower.split(' ').filter(p => p.length > 2);
+
+  // Extract the city name from leadLocation (usually the first part before comma)
+  const cityToken = (leadLocation || '').split(',')[0].trim().toLowerCase();
+
+  console.log(`[injected] 🔍 Strict match: product="${leadProduct}", location="${leadLocation}" (city="${cityToken}"), displayId="${leadDisplayId}", minQty=${minQtyKg}kg`);
+
+  // ── Early exit: "no results" page ─────────────────────────────────────────
+  const pageText = document.body?.innerText || '';
+  if (/sorry.*did not get any results/i.test(pageText) ||
+      /no\s+results?\s+found/i.test(pageText) ||
+      /0\s+buyers?\s+for/i.test(pageText)) {
+    console.warn(`[injected] ⚠️ IndiaMART returned NO RESULTS for this search`);
+    return { ok: false, reason: 'no_search_results', pageTitle: document.title };
+  }
+
+  // ── Parse quantity from card text ─────────────────────────────────────────
+  function parseQtyFromText(text) {
+    const m = text.match(/quantity\s*[:：]\s*([\d,]+(?:\.\d+)?)\s*(kg|tonne?s?|mt|metric|quintal|grams?)/i);
+    if (!m) return null;
+    const num = parseFloat(m[1].replace(/,/g, ''));
+    if (!num || num <= 0) return null;
+    const unit = m[2].toLowerCase();
+    if (/ton|mt|metric/.test(unit)) return num * 1000;
+    if (/quintal/.test(unit)) return num * 100;
+    if (/gram/.test(unit)) return num * 0.001;
+    return num;
+  }
+
+  // ── Find contact buttons ──────────────────────────────────────────────────
+  const traButtons = [...document.querySelectorAll('.TRA_contact_buyer')].filter(isVisible);
+  const CONTACT_TEXTS = ['contact buyer now', 'contact buyer', 'contact now', 'send enquiry', 'enquire now', 'buy lead'];
+
+  const otherButtons = [];
+  if (traButtons.length === 0) {
+    for (const el of document.querySelectorAll('button, a[role=button], input[type=button], input[type=submit], [role=button]')) {
+      if (!isVisible(el)) continue;
+      const t = (el.textContent || el.value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      if (CONTACT_TEXTS.some(ct => t.includes(ct))) otherButtons.push(el);
+    }
+  }
+
+  const contactButtons = traButtons.length > 0 ? traButtons : otherButtons;
+  console.log(`[injected] Found ${contactButtons.length} contact buttons`);
+
+  if (contactButtons.length === 0) {
+    return { ok: false, reason: 'no_contact_buttons_found', pageTitle: document.title };
+  }
+
+  // ── Find listing container ────────────────────────────────────────────────
+  function getListingContainer(btn) {
+    let el = btn.parentElement, depth = 0;
+    while (el && depth < 10) {
+      if (el.id && /^list\d+$/.test(el.id)) return el;
+      el = el.parentElement; depth++;
+    }
+    el = btn.parentElement; depth = 0;
+    while (el && depth < 12) {
+      if ((el.textContent || '').length > 50 && (el.textContent || '').length < 5000) return el;
+      el = el.parentElement; depth++;
+    }
+    return btn.parentElement;
+  }
+
+  // ── Dynamic product matching ratio threshold ──────────────────────────────
+  let reqProdRatio = 0.4;
+  if (prodWords.length <= 2) {
+    reqProdRatio = 1.0; // Both words must match for short product names
+  } else if (prodWords.length === 3) {
+    reqProdRatio = 0.66; // At least 2 of 3 words must match
+  } else {
+    reqProdRatio = 0.5; // At least 50% of words must match
+  }
+
+  // ── Score each listing ────────────────────────────────────────────────────
+  const listings = contactButtons.map((btn, i) => {
+    const container = getListingContainer(btn);
+    const cText = (container?.textContent || '').toLowerCase();
+    const cHtml = container?.innerHTML || '';
+
+    const hasDisplayId = leadDisplayId ? cHtml.includes(leadDisplayId) : false;
+    const prodHits = prodWords.filter(w => cText.includes(w)).length;
+    const prodRatio = prodWords.length > 0 ? prodHits / prodWords.length : 0;
+    const locHits = locParts.filter(p => cText.includes(p)).length;
+    const locRatio = locParts.length > 0 ? locHits / locParts.length : 0;
+    const cardQty = parseQtyFromText(cText);
+    const qtyOk = cardQty !== null && minQtyKg > 0 ? cardQty >= minQtyKg : true;
+
+    // Strict city matching: if lead location has a city, the card must contain it
+    const matchesCity = !cityToken || cText.includes(cityToken);
+
+    console.log(`[injected] Card ${i}: prod=${prodHits}/${prodWords.length} loc=${locHits}/${locParts.length} matchesCity=${matchesCity} qty=${cardQty}kg(min=${minQtyKg}) id=${hasDisplayId}`);
+
+    return { btn, hasDisplayId, prodHits, prodRatio, locHits, locRatio, cardQty, qtyOk, matchesCity, cText };
+  });
+
+  // ── Match by displayId (most precise) ─────────────────────────────────────
+  const idMatch = listings.find(l => l.hasDisplayId);
+  if (idMatch) {
+    console.log(`[injected] ✅ Matched by displayId: ${leadDisplayId}`);
+    realClick(idMatch.btn);
+    return { ok: true, phase: 1, matched: 'displayId', displayId: leadDisplayId };
+  }
+
+  // ── Strict composite match ────────────────────────────────────────────────
+  // Require: product match + city match + quantity passes minimum
+  const candidates = listings.filter(l =>
+    l.prodRatio >= reqProdRatio &&
+    l.matchesCity &&
+    l.qtyOk
+  );
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => {
+      const sA = a.prodRatio * 0.4 + a.locRatio * 0.6;
+      const sB = b.prodRatio * 0.4 + b.locRatio * 0.6;
+      return sB - sA;
+    });
+    const best = candidates[0];
+    const score = best.prodRatio * 0.4 + best.locRatio * 0.6;
+
+    console.log(`[injected] ✅ Strict match candidate: prod=${best.prodHits}/${prodWords.length} loc=${best.locHits}/${locParts.length} qty=${best.cardQty}kg score=${score.toFixed(2)}`);
+    realClick(best.btn);
+    return {
+      ok: true, phase: 1, matched: 'strict-composite',
+      prodMatch: `${best.prodHits}/${prodWords.length}`,
+      locMatch: `${best.locHits}/${locParts.length}`,
+      cardQtyKg: best.cardQty,
+      score: score.toFixed(2),
+    };
+  }
+
+  // ── No strict match — refuse to click ─────────────────────────────────────
+  console.warn(`[injected] ❌ No strict match for "${leadProduct}" @ "${leadLocation}" (min ${minQtyKg}kg)`);
+  return {
+    ok: false,
+    reason: 'no_strict_match',
+    searchedFor: { product: leadProduct, location: leadLocation, displayId: leadDisplayId, minQtyKg },
+    listingCount: listings.length,
+    cardInfo: listings.slice(0, 5).map(l => ({
+      prod: `${l.prodHits}/${prodWords.length}`, loc: `${l.locHits}/${locParts.length}`,
+      qty: l.cardQty, qtyOk: l.qtyOk, matchesCity: l.matchesCity,
+      snippet: l.cText.replace(/\s+/g, ' ').trim().slice(0, 120),
+    })),
+  };
+}
+
+
+/**
+ * DETAIL PAGE CLICK — Simpler version for direct lead detail pages
+ * (buylead/detail.mp?blid=...) where there's exactly one listing.
+ * Just finds the first visible contact button and clicks it.
+ */
+function injectedClickOnDetailPage(leadDisplayId, leadProduct, leadLocation) {
+  const pageUrl = window.location.href;
+  const pageText = (document.body?.innerText || '').toLowerCase();
+
+  console.log(`[injected-detail] Checking detail page for displayId=${leadDisplayId}, product="${leadProduct}", location="${leadLocation}"`);
+  console.log(`[injected-detail] Page URL: ${pageUrl}`);
+
+  // ── Check 1: URL still contains the display ID (not redirected) ───────────
+  if (leadDisplayId && !pageUrl.includes(leadDisplayId)) {
+    console.warn(`[injected-detail] ❌ Redirected away from lead. Expected blid=${leadDisplayId}, got URL: ${pageUrl}`);
+    return { ok: false, reason: 'redirected_away_from_lead_page' };
+  }
+
+  // ── Check 2: Page contains expired/inactive indicators ────────────────────
+  const EXPIRED_PATTERNS = /expired|no\s+longer\s+active|similar\s+requirements|requirement\s+closed|requirement\s+fulfilled|this\s+requirement\s+has|no\s+longer\s+looking|buyer\s+has\s+already|not\s+available|lead\s+closed|requirement\s+is\s+closed|looking\s+for\s+similar/i;
+  if (EXPIRED_PATTERNS.test(pageText)) {
+    console.warn(`[injected-detail] ❌ Lead ${leadDisplayId} appears expired or inactive.`);
+    return { ok: false, reason: 'lead_expired' };
+  }
+
+  // ── Check 3: Verify the page actually contains the target product ─────────
+  const prodClean = (leadProduct || '').toLowerCase()
+    .replace(/&amp;/g, ' ').replace(/[&]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const prodWords = prodClean.split(' ').filter(w => w.length > 2);
+
+  if (prodWords.length > 0) {
+    const prodHits = prodWords.filter(w => pageText.includes(w)).length;
+    const prodRatio = prodHits / prodWords.length;
+    console.log(`[injected-detail] Product check: ${prodHits}/${prodWords.length} words found (ratio=${prodRatio.toFixed(2)})`);
+
+    if (prodRatio < 0.5) {
+      console.warn(`[injected-detail] ❌ Product mismatch: page doesn't contain enough product words ("${leadProduct}")`);
+      return { ok: false, reason: 'product_mismatch_on_detail_page' };
+    }
+  }
+
+  // ── Check 4: Verify the page contains the target city ─────────────────────
+  const cityToken = (leadLocation || '').split(',')[0].trim().toLowerCase();
+  if (cityToken && cityToken.length > 2 && !pageText.includes(cityToken)) {
+    console.warn(`[injected-detail] ❌ City mismatch: page doesn't mention "${cityToken}"`);
+    return { ok: false, reason: 'location_mismatch_on_detail_page' };
+  }
+
+  // ── All checks passed — find and click the contact button ─────────────────
   function isVisible(el) {
     if (!el) return false;
     const s = window.getComputedStyle(el);
@@ -251,151 +503,41 @@ function injectedClickPhase1(leadLocation, leadDisplayId) {
       .toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
-  // ── Normalize location for matching ───────────────────────────────────────
-  const locLower = (leadLocation || '').toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
-  const locParts = locLower.split(' ').filter(p => p.length > 2); // e.g. ["kamrup", "assam"]
-
-  console.log(`[injected] 🔍 Looking for: location="${leadLocation}", displayId="${leadDisplayId}"`);
-
-  // ── Step 1: Find ALL contact buttons on the page ──────────────────────────
   const CONTACT_TEXTS = [
     'contact buyer now', 'contact buyer', 'contact now',
-    'send enquiry', 'enquire now', 'buy lead',
+    'send enquiry', 'enquire now',
   ];
 
   const allClickables = [
     ...document.querySelectorAll(
-      'button, a, div, span, input[type=button], input[type=submit], [role=button], .TRA_contact_buyer'
+      'button, a, div, span, input[type=button], input[type=submit], [role=button], .TRA_contact_buyer, .btn'
     ),
   ];
 
-  // Collect all visible contact buttons
-  const contactButtons = [];
+  console.log(`[injected-detail] Scanning ${allClickables.length} clickable elements…`);
+
   for (const el of allClickables) {
     if (!isVisible(el)) continue;
     const t = getNormText(el);
     if (CONTACT_TEXTS.some(ct => t.includes(ct))) {
-      contactButtons.push(el);
+      console.log(`[injected-detail] ✅ Found and clicking: "${t}" [${el.tagName}.${(el.className || '').toString().slice(0, 40)}]`);
+      el.click();
+      return { ok: true, phase: 1, matched: 'detail-page', text: t };
     }
   }
 
-  console.log(`[injected] Found ${contactButtons.length} contact buttons on page`);
+  // Debug: dump visible buttons
+  const visibleBtns = allClickables
+    .filter(el => isVisible(el))
+    .slice(0, 20)
+    .map(el => `[${el.tagName}.${(el.className || '').toString().slice(0, 30)}] "${getNormText(el).slice(0, 50)}"`);
 
-  if (contactButtons.length === 0) {
-    return {
-      ok: false, reason: 'no_contact_buttons_found',
-      pageButtons: allClickables.slice(0, 15).map(el =>
-        `[${el.tagName}.${(el.className || '').toString().slice(0, 30)}] "${getNormText(el).slice(0, 40)}"`
-      ),
-    };
-  }
+  console.warn(`[injected-detail] ❌ No contact button found. Visible buttons:`, visibleBtns);
 
-  // ── Step 2: For each button, walk UP the DOM to find its listing container ─
-  // A "listing container" is a parent that has enough text (location, product info)
-  // We walk up until we find an element with substantial text content
-  function getListingContainer(btn) {
-    let el = btn.parentElement;
-    let depth = 0;
-    while (el && depth < 12) {
-      const text = el.textContent || '';
-      // A listing container typically has 50+ chars (product name + location + details)
-      if (text.length > 50 && text.length < 5000) {
-        return el;
-      }
-      el = el.parentElement;
-      depth++;
-    }
-    // If we didn't find a good container, return the closest parent with some text
-    el = btn.parentElement;
-    depth = 0;
-    while (el && depth < 8) {
-      if ((el.textContent || '').length > 30) return el;
-      el = el.parentElement;
-      depth++;
-    }
-    return btn.parentElement;
-  }
-
-  // Build an array of { button, container, containerText }
-  const listings = contactButtons.map(btn => {
-    const container = getListingContainer(btn);
-    const containerText = (container?.textContent || '').toLowerCase();
-    return { btn, container, containerText };
-  });
-
-  // Log what we found for debugging
-  listings.forEach((l, i) => {
-    const snippet = l.containerText.replace(/\s+/g, ' ').trim().slice(0, 120);
-    console.log(`[injected] Listing ${i}: "${snippet}..."`);
-  });
-
-  // ── Step 3: Match by displayId (most precise) ─────────────────────────────
-  if (leadDisplayId) {
-    for (const l of listings) {
-      // Check if displayId appears anywhere in the container's HTML or data attributes
-      const html = l.container?.innerHTML || '';
-      if (html.includes(leadDisplayId)) {
-        console.log(`[injected] ✅ Matched by displayId: ${leadDisplayId}`);
-        l.btn.click();
-        return { ok: true, phase: 1, matched: 'displayId', displayId: leadDisplayId };
-      }
-    }
-  }
-
-  // ── Step 4: Match by location text (primary strategy) ─────────────────────
-  if (locParts.length > 0) {
-    // Score each listing by how many location parts it contains
-    const scored = listings.map(l => {
-      const matchCount = locParts.filter(part => l.containerText.includes(part)).length;
-      return { ...l, matchCount, matchRatio: matchCount / locParts.length };
-    });
-
-    // Sort by match count descending
-    scored.sort((a, b) => b.matchCount - a.matchCount);
-
-    // Best match must have ALL location parts (or at least the majority)
-    const best = scored[0];
-    if (best && best.matchRatio >= 0.5) {
-      // Make sure it's actually a better match than the second-best
-      const secondBest = scored[1];
-      const isUnique = !secondBest || best.matchCount > secondBest.matchCount;
-
-      console.log(`[injected] ✅ Matched by location: ${best.matchCount}/${locParts.length} parts`
-        + ` (unique=${isUnique})`);
-      console.log(`[injected]    Parts matched: ${locParts.filter(p => best.containerText.includes(p)).join(', ')}`);
-
-      best.btn.click();
-      return {
-        ok: true, phase: 1, matched: 'location',
-        location: leadLocation,
-        matchCount: best.matchCount,
-        totalParts: locParts.length,
-        isUnique,
-        cardSnippet: best.containerText.replace(/\s+/g, ' ').trim().slice(0, 120),
-      };
-    }
-  }
-
-  // ── Step 5: ONLY click first if there's exactly 1 listing (unambiguous) ───
-  if (listings.length === 1) {
-    console.log(`[injected] ⚠️ Only 1 listing on page — clicking it`);
-    listings[0].btn.click();
-    return {
-      ok: true, phase: 1, matched: 'single-result',
-      cardSnippet: listings[0].containerText.replace(/\s+/g, ' ').trim().slice(0, 120),
-    };
-  }
-
-  // ── No match found — return debug info ────────────────────────────────────
-  console.warn(`[injected] ❌ Could not match location "${leadLocation}" to any listing`);
   return {
     ok: false,
-    reason: 'location_not_matched',
-    searchedFor: { location: leadLocation, displayId: leadDisplayId, locParts },
-    listingCount: listings.length,
-    cardInfo: listings.slice(0, 5).map(l =>
-      l.containerText.replace(/\s+/g, ' ').trim().slice(0, 120)
-    ),
+    reason: 'no_contact_button_on_detail_page',
+    visibleButtons: visibleBtns,
   };
 }
 
@@ -573,20 +715,78 @@ function injectedLoginIfNeeded(mobile, password) {
   return { ok: true, loggedIn: true };
 }
 
+/**
+ * Sanitize product name for use in search queries.
+ * - Decodes HTML entities (&amp; → &, &lt; → <, etc.)
+ * - Strips & and special chars that break IndiaMART search or cause ambiguity
+ * - Collapses extra whitespace
+ */
+function sanitizeProductForSearch(product) {
+  if (!product) return '';
+  let s = product;
+  // Decode common HTML entities
+  s = s.replace(/&amp;/gi, '&')
+       .replace(/&lt;/gi, '<')
+       .replace(/&gt;/gi, '>')
+       .replace(/&quot;/gi, '"')
+       .replace(/&#39;/gi, "'")
+       .replace(/&#?\w+;/g, ' ');  // catch any remaining HTML entities
+  // Strip & and other characters that corrupt search URLs or cause ambiguity
+  s = s.replace(/[&]+/g, ' ');
+  // Collapse multiple spaces
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
+}
+
 async function processOneLead(lead, attempt = 1) {
+  // Sanitize product name (e.g. "Dry Fruits &amp; Nuts" → "Dry Fruits Nuts")
+  const cleanProduct = sanitizeProductForSearch(lead.product);
+
   // Build search URL based on attempt:
   //   Attempt 1: product + full location (e.g. "Cashew Husk Kamrup, Assam")
-  //   Attempt 2: product + state only  (e.g. "Cashew Husk Assam") — broader search
-  let searchQuery;
-  if (attempt <= 1) {
-    searchQuery = `${lead.product} ${lead.location || ''}`;
-  } else {
-    // Fallback: use product + state (drop district/city for broader results)
-    searchQuery = `${lead.product} ${lead.state || ''}`;
-  }
-  const url = `https://trade.indiamart.com/buyersearch.mp?ss=${encodeURIComponent(searchQuery.trim())}`;
+  //   Attempt 2: product + city only   (e.g. "Cashew Husk Kamrup")  — drops state
+  //   Attempt 3: product + state only  (e.g. "Cashew Husk Assam")
+  //   Attempt 4: product only          (e.g. "Cashew Husk")         — broadest search
+  //   Attempt 5: direct lead URL       (buylead/detail.mp?blid=...) — last resort
+  let url;
+  let isDirectUrl = false;
 
-  console.log(`[bg] Processing "${lead.product}" @ ${lead.location} (attempt ${attempt}, search: "${searchQuery.trim()}")`);
+  if (attempt <= 1) {
+    const q = `${cleanProduct} ${lead.location || ''}`.trim();
+    url = `https://trade.indiamart.com/buyersearch.mp?ss=${encodeURIComponent(q)}`;
+  } else if (attempt === 2) {
+    // Fallback: product + city only (first part of "City, State")
+    const city = (lead.location || '').split(',')[0].trim();
+    const q = city ? `${cleanProduct} ${city}` : `${cleanProduct} ${lead.state || ''}`;
+    url = `https://trade.indiamart.com/buyersearch.mp?ss=${encodeURIComponent(q.trim())}`;
+  } else if (attempt === 3) {
+    const q = `${cleanProduct} ${lead.state || ''}`.trim();
+    url = `https://trade.indiamart.com/buyersearch.mp?ss=${encodeURIComponent(q)}`;
+  } else if (attempt === 4) {
+    // Product-only search (broadest)
+    url = `https://trade.indiamart.com/buyersearch.mp?ss=${encodeURIComponent(cleanProduct)}`;
+  } else {
+    // Last resort: direct lead detail URL
+    if (lead.displayId) {
+      url = `https://trade.indiamart.com/buylead/detail.mp?blid=${lead.displayId}`;
+      isDirectUrl = true;
+    } else {
+      // No displayId available, nothing left to try
+      console.warn(`[bg] No displayId for "${lead.product}" — all attempts exhausted`);
+      expiredLeads.push({
+        product: lead.product, location: lead.location,
+        state: lead.state || '', quantity: lead.rawQty || '',
+        reason: 'all_attempts_exhausted',
+        timestamp: new Date().toISOString(),
+      });
+      saveExpiredLeads();
+      notify('⚠️ Lead expired', `${lead.product} @ ${lead.location}: lead no longer available on IndiaMART`);
+      return { ok: false, reason: 'all_attempts_exhausted' };
+    }
+  }
+
+  const strategyNames = ['product+location', 'product+city', 'product+state', 'product-only', 'direct-url'];
+  console.log(`[bg] Processing "${lead.product}" @ ${lead.location} (attempt ${attempt}/${MAX_RETRIES}, strategy: ${strategyNames[attempt - 1] || 'unknown'})`);
 
   let tabId;
   try {
@@ -599,6 +799,13 @@ async function processOneLead(lead, attempt = 1) {
     if (!await tabExists(tabId)) {
       console.warn(`[bg] Tab ${tabId} was closed before Phase-1 injection — skipping`);
       tabId = null;
+      expiredLeads.push({
+        product: lead.product, location: lead.location,
+        state: lead.state || '', quantity: lead.rawQty || '',
+        reason: 'tab_closed_before_phase1',
+        timestamp: new Date().toISOString(),
+      });
+      saveExpiredLeads();
       return { ok: false, reason: 'tab_closed_before_phase1' };
     }
 
@@ -613,6 +820,13 @@ async function processOneLead(lead, attempt = 1) {
 
     if (!p0res?.ok) {
       console.error(`[bg] Login wall detected but could not log in: ${p0res?.reason}`);
+      expiredLeads.push({
+        product: lead.product, location: lead.location,
+        state: lead.state || '', quantity: lead.rawQty || '',
+        reason: p0res?.reason || 'login_failed',
+        timestamp: new Date().toISOString(),
+      });
+      saveExpiredLeads();
       notify('🔐 Login required', p0res?.hint || 'Set your IndiaMART credentials in the popup');
       return { ok: false, reason: p0res?.reason };
     }
@@ -622,57 +836,113 @@ async function processOneLead(lead, attempt = 1) {
       await sleep(5000);
       if (!await tabExists(tabId)) {
         tabId = null;
+        expiredLeads.push({
+          product: lead.product, location: lead.location,
+          state: lead.state || '', quantity: lead.rawQty || '',
+          reason: 'tab_closed_after_login',
+          timestamp: new Date().toISOString(),
+        });
+        saveExpiredLeads();
         return { ok: false, reason: 'tab_closed_after_login' };
       }
     }
 
-    // ── Phase 1: click "Contact Buyer Now" for the matching dealer ───────────
-    const [p1] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func:   injectedClickPhase1,
-      args:   [lead.location || '', lead.displayId || ''],
-    });
-    const p1res = p1?.result;
+    // ── Phase 1: click "Contact Buyer Now" ─────────────────────────────────
+    let p1res;
+    if (isDirectUrl) {
+      // Direct lead detail page — use the detail-page clicker with verification
+      const [p1] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func:   injectedClickOnDetailPage,
+        args:   [lead.displayId || '', lead.product || '', lead.location || ''],
+      });
+      p1res = p1?.result;
+    } else {
+      // Search results page — use the strict matching logic
+      const [p1] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func:   injectedClickPhase1,
+        args:   [lead.product || '', lead.location || '', lead.displayId || '', lead.qtyKg ?? 100],
+      });
+      p1res = p1?.result;
+    }
     console.log(`[bg] Phase-1 result:`, p1res);
 
     if (!p1res?.ok) {
-      console.warn(`[bg] Phase-1 failed (attempt ${attempt}). Cards:`, p1res?.cardInfo, 'Buttons:', p1res?.pageButtons);
+      const failReason = p1res?.reason || 'unknown';
+      console.warn(`[bg] Phase-1 failed (attempt ${attempt}/${MAX_RETRIES}, reason: ${failReason}). Cards:`, p1res?.cardInfo);
 
       // Close this tab before retrying with broader search
       await closeTab(tabId); tabId = null;
 
       if (attempt < MAX_RETRIES) {
-        console.log(`[bg] Retrying with broader search (product + state)…`);
+        const nextStrategy = strategyNames[attempt] || 'broader search';
+        console.log(`[bg] Retrying with ${nextStrategy}…`);
         await sleep(3000);
         return processOneLead(lead, attempt + 1);
       }
-      notify('⚠️ Button not found', `${lead.product} @ ${lead.location}: could not find the correct dealer`);
-      return { ok: false, reason: p1res?.reason };
+
+      // All attempts exhausted
+      // Track this expired lead for display in popup
+      expiredLeads.push({
+        product:   lead.product,
+        location:  lead.location,
+        state:     lead.state || '',
+        quantity:  lead.rawQty || '',
+        reason:    failReason,
+        timestamp: new Date().toISOString(),
+      });
+      saveExpiredLeads();
+      notify('⏰ Lead expired', `${lead.product} @ ${lead.location}: no longer available on IndiaMART`);
+
+      return { ok: false, reason: failReason };
     }
 
-    // ── Phase 1 click = success ──────────────────────────────────────────────
-    console.log(`[bg] ✅ Clicked via strategy: ${p1res.matched} (attempt ${attempt})`);
+    // ── Phase 1 click succeeded — now wait for confirmation modal ────────────
+    console.log(`[bg] ✅ Phase-1 clicked via strategy: ${p1res.matched} (attempt ${attempt})`);
+
+    // Wait a bit for the modal to appear after the click
+    await sleep(MODAL_WAIT_MS);
+
+    // ── Contact successful — IndiaMART processes the click directly ──────────
+    // No confirmation modal to handle; the click itself completes the contact.
     stats.clicked++;
     saveStats();
     notify(
       '✅ Contacted!',
       `${lead.product}\n${lead.location} · ${lead.rawQty}`
     );
-    await sleep(1000);
+
+    await sleep(1500);
     return { ok: true };
 
   } catch (e) {
-    // Gracefully handle tab-already-closed errors without retrying
-    if (e.message && e.message.includes('No tab with id')) {
+    const isTabVanished = e.message && e.message.includes('No tab with id');
+    if (isTabVanished) {
       console.warn(`[bg] Tab vanished mid-process for "${lead.product}" — skipping retry`);
-      return { ok: false, reason: 'tab_vanished' };
+    } else {
+      console.error(`[bg] Error processing ${lead.id}:`, e.message);
     }
-    console.error(`[bg] Error processing ${lead.id}:`, e.message);
-    if (attempt < MAX_RETRIES) {
+
+    if (!isTabVanished && attempt < MAX_RETRIES) {
       await sleep(3000);
       return processOneLead(lead, attempt + 1);
     }
-    return { ok: false, reason: e.message };
+
+    // All attempts exhausted or tab vanished (no point retrying)
+    const reason = isTabVanished ? 'tab_vanished' : (e.message || 'unknown_error');
+    expiredLeads.push({
+      product:   lead.product,
+      location:  lead.location,
+      state:     lead.state || '',
+      quantity:  lead.rawQty || '',
+      reason:    reason,
+      timestamp: new Date().toISOString(),
+    });
+    saveExpiredLeads();
+    notify('⏰ Lead expired', `${lead.product} @ ${lead.location}: no longer available on IndiaMART`);
+
+    return { ok: false, reason: reason };
   } finally {
     await sleep(2000);
     if (tabId) await closeTab(tabId);
@@ -741,6 +1011,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         stats,
         queueLength:  queue.length,
         isProcessing,
+        expiredLeads,
       });
       break;
 
@@ -750,9 +1021,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     case 'CLEAR_ALL':
       processedIds = new Set();
+      expiredLeads = [];
       stats        = { scanned: 0, matched: 0, clicked: 0 };
       queue        = [];
-      chrome.storage.local.set({ processedIds: [], stats, clicked: 0 });
+      chrome.storage.local.set({ processedIds: [], expiredLeads: [], stats, clicked: 0 });
       sendResponse({ ok: true });
       break;
 

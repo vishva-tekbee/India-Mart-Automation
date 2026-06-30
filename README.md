@@ -1,89 +1,47 @@
 # IndiaMART Lead Auto-Contact
 
-> Automated pipeline that scrapes buyer leads from IndiaMART, filters them by quantity, and clicks "Contact Buyer Now" via a Chrome extension.
+Automated pipeline that scrapes buyer leads from IndiaMART, filters them by business criteria (GST, quantity, state, longevity), stores them in-memory with JSON file persistence, and contacts qualifying buyers via a Chrome extension.
 
----
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Project Structure](#project-structure)
-- [Component Details](#component-details)
-  - [1. Scraper — `scrape_indiamart.py`](#1-scraper--scrape_indiamartpy)
-  - [2. Loop + Local Server — `scraper_loop.py`](#2-loop--local-server--scraper_looppy)
-  - [3. Chrome Extension — `indiamart-extension/`](#3-chrome-extension--indiamart-extension)
-- [Data Flow](#data-flow)
-- [Output Files](#output-files)
-- [Setup & Installation](#setup--installation)
-- [Running the System](#running-the-system)
-- [Configuration Reference](#configuration-reference)
-- [Extension Popup UI](#extension-popup-ui)
-- [Known Behaviours & Notes](#known-behaviours--notes)
-
----
-
-## Overview
-
-This project has two distinct halves that talk to each other over localhost:
-
-| Half | Technology | Role |
-|---|---|---|
-| **Backend** | Python + Playwright | Scrapes IndiaMART search results and serves them as JSON |
-| **Frontend** | Chrome Extension (MV3) | Consumes the JSON, filters leads, opens tabs and clicks the contact button |
-
+![Extension UI](<Screenshot from 2026-06-30 12-37-02.png>)
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         Python Backend                           │
-│                                                                  │
-│  scrape_indiamart.py                                             │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  Playwright (headless Chromium)                         │     │
-│  │  1. Loads trade.indiamart.com/buyersearch.mp?ss=cashew  │     │
-│  │  2. Intercepts XHR to /tradereact/searchpage            │     │
-│  │  3. Paginates via direct POST (up to 500 results)       │     │
-│  │  4. Parses & deduplicates → JSON array                  │     │
-│  └──────────────────────────────┬──────────────────────────┘     │
-│                                 │ returns parsed leads           │
-│  scraper_loop.py                ▼                                │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  Async loop — re-scrapes every INTERVAL_MINUTES (5 min) │     │
-│  │  Writes result atomically to latest_leads.json          │     │
-│  │                                                         │     │
-│  │  HTTP server on 127.0.0.1:7891 (background thread)      │     │
-│  │    GET /leads   → serves latest_leads.json              │     │
-│  │    GET /status  → JSON health/meta                      │     │
-│  └──────────────────────────────┬──────────────────────────┘     │
-└─────────────────────────────────┼────────────────────────────────┘
-                                  │  HTTP (CORS enabled)
-                                  ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                     Chrome Extension (MV3)                       │
-│                                                                  │
-│  background.js  (service worker)                                 │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  1. Polls /leads on a configurable interval             │     │
-│  │  2. Parses quantity, filters by threshold (≥ 500 kg)    │     │
-│  │  3. Deduplicates via processedIds (chrome.storage)      │     │
-│  │  4. Queues qualifying leads                             │     │
-│  │  5. Opens tab → Phase-0 (login) → Phase-1 (click btn)  │     │
-│  │  6. Sends desktop notification on success/failure       │     │
-│  └─────────────────────────────────────────────────────────┘     │
-│                                                                  │
-│  popup.html / popup.js / popup.css  (control panel UI)           │
-│  ┌─────────────────────────────────────────────────────────┐     │
-│  │  • Server status indicator                              │     │
-│  │  • Enable/disable automation toggle                     │     │
-│  │  • Threshold & poll interval settings                   │     │
-│  │  • Live stats: Scanned / Matched / Contacted            │     │
-│  │  • Queue status                                         │     │
-│  │  • Run Now / Refresh / Clear History buttons            │     │
-│  └─────────────────────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        FastAPI Server (port 8000)                     │
+│                                                                      │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────────────────┐ │
+│  │  Scheduler   │───▶│  Scraper      │───▶│  In-Memory + JSON File   │ │
+│  │ (APScheduler)│    │  (Playwright) │    │  latest_leads.json       │ │
+│  │ every 5 min  │    │              │    │  Dedup: product+location │ │
+│  └─────────────┘    └──────────────┘    └──────────┬───────────────┘ │
+│                                                     │                 │
+│  ┌─────────────────────────────────────────────────┐│                 │
+│  │  REST API                                       ││                 │
+│  │  GET /leads        → current qualified leads    │◀                 │
+│  │  GET /status       → health + counts            │                  │
+│  │  GET /api/leads    → all leads (CRM)            │                  │
+│  │  GET /api/leads/csv→ CSV export                 │                  │
+│  └──────────────────────┬──────────────────────────┘                  │
+└─────────────────────────┼────────────────────────────────────────────┘
+                          │  HTTP (localhost:8000)
+                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                   Chrome Extension (Manifest V3)                      │
+│                                                                      │
+│  ┌────────────┐    ┌──────────────────────────────────────────────┐  │
+│  │  popup.js   │◀──▶│  background.js (Service Worker)              │  │
+│  │  (UI layer) │    │                                              │  │
+│  └────────────┘    │  1. Fetches /leads from server                │  │
+│                    │  2. Filters out already-processed leads        │  │
+│                    │  3. Opens IndiaMART tabs in background         │  │
+│                    │  4. Injects scripts to click "Contact Buyer"   │  │
+│                    │  5. Handles login walls, modals, retries        │  │
+│                    │  6. Tracks completed/expired/processing stats   │  │
+│                    └──────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -92,20 +50,33 @@ This project has two distinct halves that talk to each other over localhost:
 
 ```
 web-scraper/
-├── scrape_indiamart.py        # Core Playwright scraper
-├── scraper_loop.py            # Scheduler + local HTTP server
-├── latest_leads.json          # Live output (overwritten every cycle)
-├── indiamart_cashew.json      # Fallback / first-run output
-└── indiamart-extension/
-    ├── manifest.json          # Chrome MV3 manifest
-    ├── background.js          # Service worker (all core logic)
-    ├── popup.html             # Extension popup markup
-    ├── popup.js               # Popup → background messaging
-    ├── popup.css              # Popup styles
-    └── icons/
-        ├── icon16.png
-        ├── icon48.png
-        └── icon128.png
+├── api/                          # FastAPI application package
+│   ├── __init__.py
+│   ├── config.py                 # Pydantic settings (from .env)
+│   ├── lead_store.py             # In-memory lead store + JSON file persistence
+│   ├── main.py                   # FastAPI app, CORS, middleware, compat routes
+│   ├── models.py                 # Pydantic response schemas
+│   ├── scheduler.py              # APScheduler — periodic scrape + store
+│   └── routes/
+│       ├── __init__.py
+│       ├── leads.py              # /api/leads, /api/leads/csv
+│       └── status.py             # /api/status — health + scraper stats
+│
+├── indiamart-extension/          # Chrome Extension (Manifest V3)
+│   ├── manifest.json             # Extension manifest — permissions, service worker
+│   ├── background.js             # Service worker — core automation logic
+│   ├── popup.html                # Extension popup — UI layout
+│   ├── popup.js                  # Popup logic — stats, controls, server comms
+│   ├── popup.css                 # Popup styling
+│   └── icons/                    # Extension icons (16, 48, 128px)
+│
+├── scrape_indiamart.py           # Core scraper module (Playwright + filters)
+├── scraper_loop.py               # Legacy standalone loop (superseded by api/scheduler.py)
+├── requirements.txt              # Python dependencies
+├── Dockerfile                    # Production container (Playwright + Chromium)
+├── docker-compose.yml            # Docker Compose — API service
+├── .env                          # Environment variables (gitignored)
+└── .gitignore
 ```
 
 ---
@@ -114,181 +85,166 @@ web-scraper/
 
 ### 1. Scraper — `scrape_indiamart.py`
 
-**Purpose:** Extracts buyer lead data from IndiaMART's search results page.
+The core data extraction module. Uses Playwright with headless Chromium to:
 
-**How it works:**
+1. **Load the IndiaMART trade search page** and capture the initial API request/response
+2. **Paginate through results** by replaying the captured POST request with incremented offsets
+3. **Parse lead fields** from the JSON response (`isqdetails`, `title`, `district_string`, etc.)
+4. **Apply qualification filters** via `map_fields()`:
 
-1. **Browser launch** — Playwright opens a headless Chromium window with a desktop `User-Agent`.
-2. **Request/response interception** — Hooks into `page.on("request")` and `page.on("response")` to capture the first XHR call to `/tradereact/searchpage`, extracting:
-   - The full POST body (pagination parameters)
-   - Session cookies and auth headers (`x-im-glusrid`, `x-im-sid`, `x-im-uid`)
-3. **Pagination** — Replays the captured POST body with `options.start` incremented by 10 per page, fetching up to 500 results with a 0.3 s delay between pages.
-4. **Field mapping** — `map_fields()` normalises raw API fields into a clean schema and deduplicates by `(product, location)`.
+| Filter             | Default               | Config Key            |
+|--------------------|-----------------------|-----------------------|
+| GST Verified       | Required              | `REQUIRE_GST`         |
+| Min Quantity        | ≥ 100 kg             | `MIN_QTY_KG`          |
+| Member Longevity    | ≥ 1 year             | `MIN_LONGEVITY_YEARS` |
+| Excluded States     | TN, WB, AP, OD       | `OMITTED_STATES`      |
 
-**Output schema per lead:**
+**Output:** A list of qualified lead dicts with fields: `product`, `location`, `state`, `quantity`, `quantity_kg`, `quality`, `packaging_type`, `probable_order_value`, `gst_verified`, `member_longevity`, `display_id`, `lead_url`.
 
-```json
-{
-  "product": "Cashew Nuts",
-  "location": "Mumbai, Maharashtra",
-  "quantity": "500 Kg",
-  "quality": "Good",
-  "packaging_type": "Bucket",
-  "probable_order_value": "Rs. 1.5 Lakh",
-  "probable_requirement_type": "Business Use"
-}
-```
+### 2. FastAPI Server — `api/`
 
-**Key constants:**
+Production API that wraps the scraper in a scheduled service.
 
-| Name | Value | Description |
-|---|---|---|
-| `URL` | `trade.indiamart.com/buyersearch.mp?ss=cashew` | Search seed URL |
-| `SEARCH_API` | `/tradereact/searchpage` | Intercepted XHR endpoint |
-| Max results | 500 | Configurable in the `while` loop guard |
+**Lifecycle:**
+- On startup: loads any previously scraped leads from `latest_leads.json`, starts APScheduler
+- Every N minutes (default 5): runs `scrape_and_store()` which fetches → filters → stores leads
+- On shutdown: stops scheduler
 
----
-
-### 2. Loop + Local Server — `scraper_loop.py`
-
-**Purpose:** Continuously refreshes the lead data and exposes it over HTTP so the Chrome extension can fetch it without any CORS issues.
-
-**Two concurrent roles:**
-
-| Role | Mechanism |
-|---|---|
-| **Scraper loop** | `asyncio` event loop calling `run_once()` every `INTERVAL_MINUTES` (default: 5 min) |
-| **HTTP server** | `http.server.HTTPServer` in a **daemon thread** on `127.0.0.1:7891` |
-
-**HTTP endpoints:**
-
-| Endpoint | Method | Response |
-|---|---|---|
-| `/leads` or `/leads.json` | `GET` | Full `latest_leads.json` array |
-| `/status` | `GET` | `{ ok, source, last_updated, lead_count, next_scrape_in_seconds }` |
-
-**Atomic writes:** The scraper writes to `latest_leads.tmp` then renames to `latest_leads.json`, preventing the extension from reading a half-written file.
-
-**Fallback file:** If `latest_leads.json` doesn't exist yet (first run still in progress), the server automatically falls back to `indiamart_cashew.json`.
-
----
+**Storage:**
+- Leads are stored **in-memory** for fast API access and **persisted to `latest_leads.json`** on disk
+- Each scrape cycle replaces the previous leads with fresh results
+- No database required — the JSON file survives server restarts
+- Deduplication is handled by `map_fields()` in the scraper (product + location)
 
 ### 3. Chrome Extension — `indiamart-extension/`
 
-**Manifest version:** MV3
+Manifest V3 extension that automates the "Contact Buyer Now" workflow.
 
-**Permissions:**
+**Architecture:** The popup (`popup.js`) communicates exclusively with the service worker (`background.js`) via `chrome.runtime.sendMessage`. No content scripts are used — all page interaction happens through `chrome.scripting.executeScript` injection.
 
-| Permission | Why |
-|---|---|
-| `storage` | Persist config, stats, and processed lead IDs across restarts |
-| `tabs` | Open leads in background tabs |
-| `scripting` | Inject click scripts into IndiaMART pages |
-| `notifications` | Desktop alerts on match / success / failure |
-| `activeTab` | Required by MV3 for scripting injection |
-| `host_permissions` → `*.indiamart.com` | Script injection target |
-| `host_permissions` → `127.0.0.1:7891` | Fetch leads from Python server |
-
-#### `background.js` — Service Worker
-
-All automation logic lives here. It is split into distinct phases per lead:
+**Processing Pipeline (per lead):**
 
 ```
-Phase 0 — Login Wall Detection
-  ↓  injectedLoginIfNeeded()
-  • Checks if #loginform is visible
-  • Auto-fills #email (mobile) and #usr_pass
-  • Clicks #submtbtn, waits 5 s for redirect
-
-Phase 1 — Contact Button Click
-  ↓  injectedClickPhase1()
-  • Pass 0: .TRA_contact_buyer (IndiaMART-specific class)
-  • Pass 1: Exact text "contact buyer now"
-  • Pass 2: Partial text (contact buyer, buy lead, …)
-  • Pass 3: CSS selector fallbacks
-
-Phase 2 — Modal Confirmation (legacy, kept for safety)
-  ↓  injectedClickPhase2Polling()
-  • Polls every 500 ms for up to 10 s
-  • Targets Bootstrap modals, React portals, ARIA role=dialog
+Lead from /leads
+      │
+      ▼
+Phase 0: Login check ──▶ If login wall → auto-fill credentials
+      │
+      ▼
+Phase 1: Contact click ──▶ 5 search strategies with fallback:
+      │                     1. product + full location
+      │                     2. product + city only
+      │                     3. product + state only
+      │                     4. product only
+      │                     5. direct lead URL (buylead/detail.mp?blid=...)
+      │
+      ▼
+   Result tracking:
+      ├── ✅ Completed → stats.clicked++
+      └── ❌ Expired → expiredLeads[] (with reason)
 ```
 
-**In-memory state (rebuilt from `chrome.storage` on SW restart):**
+**Daily Reset:** The extension checks for date rollover on service worker startup and before each poll cycle. When a new day is detected, it clears `processedIds`, `stats`, and `expiredLeads` from `chrome.storage.local`.
 
-```js
-cfg = { enabled, threshold, interval, mobile, password }
-stats = { scanned, matched, clicked }
-processedIds = Set<string>   // "product|location" keys
-queue = []                   // leads waiting to be processed
+**Stats Invariant:** `Matched = Completed + Expired + Currently Processing`. All failure paths (tab vanished, login failed, no credentials, etc.) are tracked in `expiredLeads`.
+
+---
+
+## API Reference
+
+### Extension Endpoints (no `/api` prefix)
+
+These are used by the Chrome extension.
+
+#### `GET /leads`
+
+Returns all current qualified leads as a JSON array.
+
+```json
+[
+  {
+    "product": "W400 Whole Cashew Nuts, 10 Kg",
+    "location": "Ranchi, Jharkhand",
+    "state": "Jharkhand",
+    "quantity": "500 Kg",
+    "quantity_kg": 500.0,
+    "quality": "Good",
+    "gst_verified": true,
+    "display_id": "12345678",
+    "lead_url": "https://trade.indiamart.com/buylead/detail.mp?blid=12345678"
+  }
+]
 ```
 
-**Message API** (popup → background):
+#### `GET /status`
 
-| Message type | Payload | Action |
-|---|---|---|
-| `SET_CREDENTIALS` | `{ mobile, password }` | Save IndiaMART login |
-| `SET_SETTINGS` | `{ enabled, threshold, interval }` | Update config, start/stop poll timer |
-| `RUN_NOW` | — | Immediately trigger one scan cycle |
-| `GET_STATUS` | — | Returns `{ cfg, stats, queueLength, isProcessing }` |
-| `GET_QUEUE_STATUS` | — | Returns `{ queueLength, isProcessing }` |
-| `CLEAR_ALL` | — | Wipe processedIds, stats, queue |
-| `CLEAR_PROCESSED_IDS` | — | Wipe only processedIds (allows re-contacting) |
+Health check with lead counts.
 
-**Quantity parser — `parseQtyKg(raw)`:**
+```json
+{
+  "ok": true,
+  "lead_count": 8,
+  "total_lead_count": 8,
+  "total_raw": 304,
+  "last_updated": "2026-06-30T12:33:17",
+  "next_scrape_in_seconds": 300
+}
+```
 
-Converts any human-readable quantity string to kilograms:
-- `"500 Kg"` → `500`
-- `"2 Tonnes"` → `2000`
-- `"5 Quintal"` → `500`
-- `"200 grams"` → `0.2`
+| Field              | Description                                       |
+|--------------------|---------------------------------------------------|
+| `lead_count`       | Current qualified leads                           |
+| `total_lead_count` | Same as `lead_count` (no separate DB)             |
+| `total_raw`        | Raw unfiltered entries from the last scrape       |
 
-#### `popup.html` / `popup.js` / `popup.css`
+### CRM Endpoints (`/api` prefix)
 
-The extension popup is a single-page control panel:
+Full endpoints for external CRM integration. See `/docs` for OpenAPI spec.
 
-- **Server card** — pings `/status` and shows online/offline dot, lead count, last updated time
-- **Automation toggle** — enable/disable the polling loop
-- **Settings card** — Min Quantity (kg) threshold, Poll Interval (minutes)
-- **Stats card** — live Scanned / Matched / Contacted counters
-- **Queue card** — pending queue depth + processing flag
-- **Action buttons** — ⚡ Run Now, 🔄 Refresh Stats, 🗑️ Clear History
+| Endpoint             | Method | Description                                  |
+|----------------------|--------|----------------------------------------------|
+| `/api/leads`         | GET    | All current leads (paginated)                |
+| `/api/leads/csv`     | GET    | CSV download                                 |
+| `/api/status`        | GET    | Health check + scraper stats                 |
 
 ---
 
 ## Data Flow
 
 ```
-IndiaMART website
-      │  (Playwright headless browser + XHR intercept)
-      ▼
-scrape_indiamart.py  →  parse & deduplicate
+IndiaMART Website
       │
+      │  Playwright (headless Chromium)
       ▼
-latest_leads.json  (written atomically every 5 min)
-      │
-      ▼
-scraper_loop.py HTTP server  (127.0.0.1:7891)
-      │  GET /leads
-      ▼
-background.js (Chrome Extension service worker)
-      │  filter by quantity ≥ threshold
-      │  deduplicate by processedIds
-      ▼
-qualifying leads queue
-      │  for each lead:
-      │    open background tab → Phase-0 login → Phase-1 click
-      ▼
-IndiaMART "Contact Buyer Now" clicked  →  desktop notification
+┌─────────────────┐
+│ Raw lead entries │  ~300 per scrape
+└────────┬────────┘
+         │  map_fields() applies:
+         │    • GST verification
+         │    • State exclusion
+         │    • Quantity threshold
+         │    • Member longevity
+         ▼
+┌─────────────────┐
+│ Qualified leads  │  ~8 per scrape
+└────────┬────────┘
+         │  In-memory store +
+         │  JSON file persistence
+         ▼
+┌─────────────────┐
+│ latest_leads.json│  Persisted on disk
+│ + in-memory list │
+└────────┬────────┘
+         │  GET /leads
+         ▼
+┌─────────────────┐
+│ Chrome Extension │
+│  background.js   │
+│                  │  Filters out already-processed leads
+│                  │  Opens tabs → injects click scripts
+│                  │  Tracks completed / expired / processing
+└─────────────────┘
 ```
-
----
-
-## Output Files
-
-| File | Description |
-|---|---|
-| `latest_leads.json` | Always-current leads array; overwritten atomically every cycle |
-| `indiamart_cashew.json` | Output of a one-shot `scrape_indiamart.py` run; used as fallback |
 
 ---
 
@@ -296,127 +252,219 @@ IndiaMART "Contact Buyer Now" clicked  →  desktop notification
 
 ### Prerequisites
 
-- Python 3.9+
-- Google Chrome / Chromium
+- **Python 3.10+**
+- **Google Chrome** (for the extension)
 
-### Python dependencies
+### 1. Clone & Install Dependencies
 
 ```bash
-pip install playwright
+git clone <repository-url>
+cd web-scraper
+
+# Create and activate virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# .venv\Scripts\activate   # Windows
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Install Playwright browser
 playwright install chromium
 ```
 
-### Load the Chrome extension
+### 2. Configure Environment
 
-1. Open Chrome and navigate to `chrome://extensions/`
+```bash
+cp .env.example .env
+# Edit .env with your settings
+```
+
+**`.env` variables:**
+
+```ini
+# Scraper
+SCRAPE_INTERVAL=5        # Minutes between scrapes
+MAX_RESULTS=500          # Max leads per scrape cycle
+
+# API
+PORT=8000
+API_KEY=your-secret-key
+
+# Filter criteria
+MIN_QTY_KG=100
+REQUIRE_GST=true
+MIN_LONGEVITY_YEARS=1
+OMITTED_STATES=tamil nadu,west bengal,andhra pradesh,odisha,orissa
+```
+
+### 3. Start the API Server
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+The server will:
+1. Load any previously scraped leads from `latest_leads.json`
+2. Start the APScheduler (first scrape runs immediately)
+3. Begin serving the REST API
+
+**Verify:** Open `http://localhost:8000/docs` for the interactive API docs.
+
+### 4. Install the Chrome Extension
+
+1. Open Chrome → `chrome://extensions/`
 2. Enable **Developer mode** (top-right toggle)
-3. Click **Load unpacked**
-4. Select the `indiamart-extension/` folder
-5. The extension icon should appear in your toolbar
+3. Click **Load unpacked** → select the `indiamart-extension/` directory
+4. Pin the extension to the toolbar
+5. Click the extension icon to open the popup
 
 ---
 
-## Running the System
-
-### Step 1 — Start the Python backend
+## Running with Docker
 
 ```bash
-cd /home/s/Desktop/web-scraper
-python3 scraper_loop.py
+# Build and start
+docker compose up --build -d
+
+# View logs
+docker compose logs -f api
+
+# Stop
+docker compose down
 ```
 
-Expected output:
-```
-IndiaMART Scraper Loop
-  Scrape interval : every 5 minutes
-  Output file     : .../latest_leads.json
-  Extension URL   : http://127.0.0.1:7891/leads
-  Status URL      : http://127.0.0.1:7891/status
-[server] Listening on http://127.0.0.1:7891
-[*] Loading initial page...
-```
-
-### Step 2 — Configure the extension
-
-1. Click the extension icon in Chrome
-2. (Optional) Enter your IndiaMART **mobile number** and **password** if leads require login
-3. Set your **Min Quantity** threshold (default 500 kg)
-4. Set your **Poll Interval** (default 5 minutes)
-5. Click **Save Settings**
-
-### Step 3 — Enable automation
-
-Toggle **Automation** to ON — the extension will now poll the Python server on schedule and automatically contact matching leads.
-
-### One-shot scrape (no loop)
+**Or without Docker Compose:**
 
 ```bash
-python3 scrape_indiamart.py
-# → writes indiamart_cashew.json and prints JSON to stdout
+# Build the image
+docker build -t indiamart-scraper .
+
+# Run the container
+docker run -d --name indiamart -p 8000:8000 --env-file .env indiamart-scraper
+
+# View logs
+docker logs -f indiamart
+
+# Stop and remove
+docker stop indiamart && docker rm indiamart
 ```
+
+> **Note:** No database is required. Leads are stored in-memory and persisted to a JSON file inside the container. If you need data to survive container restarts, mount a volume for `latest_leads.json`.
 
 ---
 
 ## Configuration Reference
 
-### `scraper_loop.py`
+### Server-Side (`.env`)
 
-```python
-INTERVAL_MINUTES = 5      # Re-scrape frequency
-SERVER_PORT      = 7891   # Local HTTP port
-OUTPUT_FILE      = "latest_leads.json"
-FALLBACK_FILE    = "indiamart_cashew.json"
-```
+| Variable              | Default          | Description                                      |
+|-----------------------|------------------|--------------------------------------------------|
+| `SCRAPE_INTERVAL`     | `5`              | Minutes between scrape cycles                    |
+| `MAX_RESULTS`         | `500`            | Max raw results to fetch per scrape              |
+| `PORT`                | `8000`           | API server port                                  |
+| `MIN_QTY_KG`          | `100`            | Minimum quantity in kg to qualify                |
+| `REQUIRE_GST`         | `true`           | Only include GST-verified buyers                 |
+| `MIN_LONGEVITY_YEARS` | `1`              | Minimum IndiaMART membership duration            |
+| `OMITTED_STATES`      | (see .env)       | Comma-separated states to exclude                |
 
-### `background.js`
+### Extension-Side (`background.js` constants)
 
-```js
-TAB_LOAD_TIMEOUT  = 20_000  // ms to wait for tab to fully load
-CLICK_WAIT_MS     = 4_000   // ms after load before injecting click
-MODAL_WAIT_MS     = 1_500   // ms after Phase-1 before Phase-2 poll
-MODAL_POLL_MS     = 500     // Phase-2 poll interval
-MODAL_TIMEOUT_MS  = 10_000  // Phase-2 total timeout
-INTER_LEAD_DELAY  = 5_000   // ms between consecutive leads
-MAX_RETRIES       = 2       // retry attempts per lead
-```
+| Constant            | Value     | Description                                      |
+|---------------------|-----------|--------------------------------------------------|
+| `TAB_LOAD_TIMEOUT`  | 20,000 ms | Max wait for a tab to finish loading             |
+| `CLICK_WAIT_MS`     | 4,000 ms  | Delay after load before injecting click script   |
+| `MODAL_WAIT_MS`     | 1,500 ms  | Delay after Phase 1 click for confirmation       |
+| `INTER_LEAD_DELAY`  | 5,000 ms  | Delay between processing consecutive leads       |
+| `MAX_RETRIES`       | 5         | Number of search strategy attempts per lead      |
 
 ---
 
 ## Extension Popup UI
 
-```
-┌─────────────────────────────┐
-│ 🤝 IndiaMART  Lead Auto-… OFF│
-├─────────────────────────────┤
-│ 🟢 Python Server   online   │
-│    Leads loaded    142      │
-│    Last updated    12:04    │
-├─────────────────────────────┤
-│ Automation              [●] │
-├─────────────────────────────┤
-│ ⚙️ Settings                  │
-│   Min Quantity   [500]  kg  │
-│   Poll Interval  [ 5 ]  min │
-│              [Save Settings]│
-├─────────────────────────────┤
-│ 📊 Statistics               │
-│  142 Scanned  3 Matched     │
-│  3 Contacted                │
-├─────────────────────────────┤
-│ 🔄 Queue Status             │
-│  Pending: 0  Processing: No │
-├─────────────────────────────┤
-│ [⚡ Run Now] [🔄] [🗑️ Clear]  │
-└─────────────────────────────┘
-```
+The popup displays real-time status of the automation pipeline:
+
+| Section          | Contents                                                              |
+|------------------|-----------------------------------------------------------------------|
+| **Server Card**  | Server health, lead count, total stored, last scrape time             |
+| **Automation**   | ON/OFF toggle — enables/disables scheduled polling                    |
+| **Statistics**   | All Leads (raw), Matched (qualified), Completed (contacted), Expired  |
+| **Queue Status** | Pending leads in background queue, current processing state           |
+| **Expired Leads**| Expandable list with failure reasons and timestamps                   |
+| **Actions**      | Run Now (manual trigger), Refresh Stats, Clear History                |
+
+### Statistics Breakdown
+
+- **All Leads** — Total raw leads from the last scrape (before filtering)
+- **Matched** — Qualified leads returned by the server (after all filters)
+- **Completed** — Successfully contacted (button clicked on IndiaMART)
+- **Expired** — Failed to contact after all retry strategies
+
+**Invariant:** `Matched = Completed + Expired + Currently Processing`
 
 ---
 
-## Known Behaviours & Notes
+## Behavioral Notes
 
-- **Anti-bot measures** — The scraper mimics a real browser session (cookies, auth headers, user-agent). If IndiaMART updates its session token format, `captured_headers` extraction in `scrape_indiamart.py` may need adjustment.
-- **Login handling** — If a lead page shows a login wall, the extension auto-fills credentials you saved in the popup. If credentials are not set, it will show a notification and skip.
-- **Deduplication** — A lead is identified by `"product|location"` (lowercase). Once contacted, it is stored in `chrome.storage` and will not be re-contacted unless you click **Clear History**.
-- **Max results cap** — The scraper fetches at most 500 leads per cycle (`min(total, 500)` in the pagination loop).
-- **Atomic file writes** — The server writes to `.tmp` then renames, so the extension never reads a partial file.
-- **Service worker lifecycle** — Chrome may suspend the MV3 service worker. State is always loaded from `chrome.storage` on restart, so no data is lost.
+### Lead Deduplication
+
+- **Server-side:** The `map_fields()` function in the scraper deduplicates by `(product, location)` before storing.
+- **Extension-side:** Leads are keyed by `product|location` in `processedIds`. Once processed (regardless of outcome), a lead is not re-processed in the same day.
+
+### Daily Reset
+
+- **Extension:** Checks for date rollover (`lastActiveDate`) on service worker startup and before each poll cycle. Clears `processedIds`, `stats`, and `expiredLeads` when a new day is detected.
+- **Server:** Each scrape cycle replaces the previous leads with fresh results from IndiaMART.
+
+### Retry Strategy
+
+When a lead cannot be found on the IndiaMART search page, the extension tries progressively broader searches:
+
+1. `product + full location` (e.g., "Cashew Nuts Ranchi, Jharkhand")
+2. `product + city only` (e.g., "Cashew Nuts Ranchi")
+3. `product + state only` (e.g., "Cashew Nuts Jharkhand")
+4. `product only` (e.g., "Cashew Nuts")
+5. `direct URL` (e.g., `buylead/detail.mp?blid=12345`)
+
+If all 5 attempts fail, the lead is marked as expired with the specific failure reason.
+
+### Failure Tracking
+
+All failure paths are tracked in `expiredLeads` with a reason code:
+
+| Reason Code                        | Human Label              | Description                                     |
+|------------------------------------|--------------------------|------------------------------------------------|
+| `no_search_results`                | No search results        | IndiaMART returned zero results for the query   |
+| `no_strict_match`                  | No matching cards        | Cards found but none matched product/location   |
+| `no_contact_buttons_found`         | No contact buttons       | Matching card has no clickable contact button    |
+| `no_contact_button_on_detail_page` | No button on detail page | Direct URL page lacks a contact button           |
+| `lead_expired`                     | Lead expired / Inactive  | IndiaMART shows the lead as closed/fulfilled     |
+| `product_mismatch_on_detail_page`  | Product mismatch         | Detail page product doesn't match the lead       |
+| `location_mismatch_on_detail_page` | Location mismatch        | Detail page city doesn't match the lead          |
+| `tab_vanished`                     | Tab closed / vanished    | Chrome tab disappeared during processing         |
+| `tab_closed_before_phase1`         | Tab closed early         | Tab closed before script injection               |
+| `tab_closed_after_login`           | Tab closed after login   | Tab closed after login form submission           |
+| `login_failed`                     | Login failed             | Login wall detected, credentials rejected        |
+| `no_credentials`                   | No credentials set       | Login wall but no credentials configured         |
+| `all_attempts_exhausted`           | All attempts failed      | All 5 retry strategies failed                    |
+| `redirected_away_from_lead_page`   | Redirected away          | Direct URL redirected to a different page         |
+
+---
+
+## Troubleshooting
+
+| Symptom                                | Likely Cause                        | Fix                                                          |
+|----------------------------------------|-------------------------------------|--------------------------------------------------------------|
+| Extension shows "Server not running"   | API server not started              | Run `uvicorn api.main:app --port 8000`                       |
+| 0 leads after scrape                   | Filters too strict or site blocked  | Check scraper logs; adjust `MIN_QTY_KG`, `OMITTED_STATES`   |
+| All leads marked expired               | IndiaMART login wall                | Set login credentials in extension popup (if applicable)     |
+| Scraper returns empty                  | Playwright browser not installed    | Run `playwright install chromium`                            |
+| Stats show 0 then jump to real values  | Normal on first load (async fetch)  | Stats show "—" while loading, then populate atomically       |
+| Extension "Receiving end does not exist"| Service worker stopped             | Reload extension at `chrome://extensions`                    |
+| Docker container exits immediately     | Port conflict or bad CMD            | Check `docker logs <name>` and free port 8000                |
+
+---
+
+## License
+
+Private — Internal use only.

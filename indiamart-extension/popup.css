@@ -183,7 +183,7 @@ input:checked + .slider::before { transform: translateX(20px); }
 /* ── Stats Grid ─────────────────────────────────────────────────────────── */
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 8px;
 }
 .stat-item {
@@ -201,6 +201,7 @@ input:checked + .slider::before { transform: translateX(20px); }
 }
 .stat-value.green { color: var(--green); }
 .stat-value.blue  { color: var(--blue);  }
+.stat-value.amber { color: var(--amber); }
 .stat-label {
   font-size: 10px;
   color: var(--muted);
@@ -220,6 +221,117 @@ input:checked + .slider::before { transform: translateX(20px); }
 .queue-row:last-child { border-bottom: none; }
 .queue-label { color: var(--muted); }
 .queue-val   { font-weight: 600; color: var(--text); }
+
+/* ── Expired Leads Section ─────────────────────────────────────────────── */
+.expired-card {
+  background: linear-gradient(135deg, #2a1f1a, #1e293b);
+  border-color: rgba(251, 191, 36, 0.2);
+}
+
+.expired-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  user-select: none;
+}
+
+.expired-header .card-title {
+  margin-bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.expired-count {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+.expand-arrow {
+  color: var(--muted);
+  font-size: 10px;
+  transition: transform 0.25s ease;
+}
+
+.expand-arrow.open {
+  transform: rotate(90deg);
+}
+
+.expired-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.expired-item {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.expired-item-product {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.expired-item-location {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.expired-item-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 2px;
+}
+
+.expired-item-reason {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--amber);
+  opacity: 0.8;
+}
+
+.expired-item-time {
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.expired-empty {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  padding: 8px 0;
+}
+
+/* Scrollbar for expired list */
+.expired-list::-webkit-scrollbar {
+  width: 4px;
+}
+.expired-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+.expired-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
 
 /* ── Footer ─────────────────────────────────────────────────────────────── */
 /* ── Server Status Card ────────────────────────────────────────────────── */

@@ -11,10 +11,6 @@ from typing import List
 class Settings(BaseSettings):
     """All config is driven by environment variables (or .env file)."""
 
-    # MongoDB
-    mongodb_uri: str = Field(default="mongodb://localhost:27017")
-    mongodb_db: str = Field(default="indiamart_leads")
-
     # Scraper
     scrape_interval: int = Field(default=5, description="Minutes between scrapes")
     max_results: int = Field(default=500, description="Max results per scrape")

@@ -23,7 +23,6 @@ class LeadOut(BaseModel):
     quantity_kg: float = 0.0
     display_id: str = ""
     lead_url: str = ""
-    created_at: datetime = Field(default_factory=datetime.utcnow)
 
     class Config:
         from_attributes = True
@@ -34,8 +33,8 @@ class StatusResponse(BaseModel):
 
     status: str = "running"
     last_scrape_time: Optional[datetime] = None
-    lead_count: int = 0
-    total_raw: int = 0
+    lead_count: int = Field(default=0, description="Current qualified lead count")
+    total_raw: int = Field(default=0, description="Raw unfiltered leads from last scrape")
     next_scrape_in_seconds: int = 0
     scrape_interval_minutes: int = 5
 
